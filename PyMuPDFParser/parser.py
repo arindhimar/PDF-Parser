@@ -23,7 +23,17 @@ Usage:
 """
 
 import os
+from io import BytesIO
 import fitz  # PyMuPDF
+
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    pytesseract = None
+    Image = None
+    OCR_AVAILABLE = False
 
 
 class PDFParser:
@@ -33,6 +43,100 @@ class PDFParser:
 
     def __init__(self):
         pass
+
+    def _extract_text_with_ocr(self, page) -> str:
+        """
+        Extract text from a page by rendering it as an image and running OCR.
+
+        Returns an empty string if OCR is unavailable or extraction fails.
+        """
+        if not OCR_AVAILABLE:
+            return ""
+
+        try:
+            # Render at higher resolution for better OCR accuracy.
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.open(BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(image)
+            return text or ""
+        except Exception:
+            return ""
+
+    def _extract_profile_picture(self, doc) -> dict | None:
+        """
+        Extract a likely profile picture from the PDF.
+
+        Strategy:
+            - Scan images on each page.
+            - Prefer images from early pages.
+            - Prefer near-square images (common for profile photos).
+            - Prefer images near the top region of page 1.
+
+        Returns:
+            dict | None: {
+                "ext": str,
+                "image_bytes": bytes,
+                "width": int,
+                "height": int,
+            } or None when no suitable image is found.
+        """
+        candidates = []
+
+        for page_index, page in enumerate(doc):
+            for image_data in page.get_images(full=True):
+                xref = image_data[0]
+
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:
+                    continue
+
+                img_bytes = extracted.get("image")
+                width = int(extracted.get("width", 0) or 0)
+                height = int(extracted.get("height", 0) or 0)
+
+                if not img_bytes or width < 40 or height < 40:
+                    continue
+
+                aspect_ratio = max(width / max(height, 1), height / max(width, 1))
+                if aspect_ratio > 2.2:
+                    # Skip very wide or tall assets (banners, separators, etc.)
+                    continue
+
+                score = (width * height) - (page_index * 20000)
+                score -= abs(width - height) * 5
+
+                # Give extra weight to images near top of first page.
+                if page_index == 0:
+                    try:
+                        rects = page.get_image_rects(xref)
+                        if rects:
+                            rect = rects[0]
+                            if rect.y0 <= (page.rect.height * 0.45):
+                                score += 40000
+                    except Exception:
+                        pass
+
+                candidates.append(
+                    {
+                        "score": score,
+                        "ext": extracted.get("ext", "png"),
+                        "image_bytes": img_bytes,
+                        "width": width,
+                        "height": height,
+                    }
+                )
+
+        if not candidates:
+            return None
+
+        best = max(candidates, key=lambda item: item["score"])
+        return {
+            "ext": best["ext"],
+            "image_bytes": best["image_bytes"],
+            "width": best["width"],
+            "height": best["height"],
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -50,6 +154,8 @@ class PDFParser:
                 "filename"   : str,   # basename of the file
                 "text"       : str,   # full text (all pages joined)
                 "page_count" : int,   # number of pages found
+                "profile_picture": dict | None,
+                "ocr_used"   : bool,  # True if OCR fallback was used
             }
 
         Raises:
@@ -70,14 +176,26 @@ class PDFParser:
         # ── Extract Text ─────────────────────────────────────────────
         page_texts = []
         page_count = 0
+        profile_picture = None
+        ocr_used = False
         
         # Opens document securely inside context manager
         with fitz.open(file_path) as doc:
             page_count = len(doc)
             
             for page in doc:
-                text = page.get_text("text") or ""
+                text = (page.get_text("text") or "").strip()
+
+                # Fallback for scanned/image-only PDFs where native text is empty.
+                if not text:
+                    text = self._extract_text_with_ocr(page).strip()
+                    if text:
+                        ocr_used = True
+
                 page_texts.append(text)
+
+            # Search once per document for a likely profile picture.
+            profile_picture = self._extract_profile_picture(doc)
 
         full_text = "\n\n".join(page_texts)
 
@@ -85,6 +203,8 @@ class PDFParser:
             "filename"   : filename,
             "text"       : full_text,
             "page_count" : page_count,
+            "profile_picture": profile_picture,
+            "ocr_used"   : ocr_used,
         }
 
     def parse_folder(self, folder_path: str) -> list:
@@ -129,6 +249,8 @@ class PDFParser:
                     "filename"   : filename,
                     "text"       : "",
                     "page_count" : 0,
+                    "profile_picture": None,
+                    "ocr_used"   : False,
                     "error"      : str(exc),
                 })
 

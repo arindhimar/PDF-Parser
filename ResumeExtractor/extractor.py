@@ -8,10 +8,21 @@ extractor.py – AI-powered Resume Parsing Module.
 
 import os
 import time
+import base64
+from io import BytesIO
 import fitz  # PyMuPDF
 from google import genai
 from google.genai import types
 from schema import CandidateProfile
+
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    pytesseract = None
+    Image = None
+    OCR_AVAILABLE = False
 
 
 class ResumeDataExtractor:
@@ -32,14 +43,98 @@ class ResumeDataExtractor:
         # Using Gemini 2.5 Flash as it is highly efficient and excellent at structured data
         self.model_name = "gemini-2.5-flash"
 
+    def _extract_text_with_ocr(self, page) -> str:
+        """Run OCR on a rendered page image when native text is missing."""
+        if not OCR_AVAILABLE:
+            return ""
+
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.open(BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(image)
+            return text or ""
+        except Exception:
+            return ""
+
+    def _extract_profile_picture(self, doc) -> dict | None:
+        """
+        Extract a likely profile picture and return JSON-safe metadata.
+        """
+        candidates = []
+
+        for page_index, page in enumerate(doc):
+            for image_data in page.get_images(full=True):
+                xref = image_data[0]
+
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:
+                    continue
+
+                img_bytes = extracted.get("image")
+                width = int(extracted.get("width", 0) or 0)
+                height = int(extracted.get("height", 0) or 0)
+
+                if not img_bytes or width < 40 or height < 40:
+                    continue
+
+                aspect_ratio = max(width / max(height, 1), height / max(width, 1))
+                if aspect_ratio > 2.2:
+                    continue
+
+                score = (width * height) - (page_index * 20000)
+                score -= abs(width - height) * 5
+
+                if page_index == 0:
+                    try:
+                        rects = page.get_image_rects(xref)
+                        if rects:
+                            rect = rects[0]
+                            if rect.y0 <= (page.rect.height * 0.45):
+                                score += 40000
+                    except Exception:
+                        pass
+
+                candidates.append(
+                    {
+                        "score": score,
+                        "ext": extracted.get("ext", "png"),
+                        "image_bytes": img_bytes,
+                        "width": width,
+                        "height": height,
+                    }
+                )
+
+        if not candidates:
+            return None
+
+        best = max(candidates, key=lambda item: item["score"])
+        return {
+            "ext": best["ext"],
+            "width": best["width"],
+            "height": best["height"],
+            "image_base64": base64.b64encode(best["image_bytes"]).decode("ascii"),
+        }
+
     def _extract_raw_text(self, file_path: str) -> str:
-        """Internal helper to extract text from a PDF."""
+        """Internal helper to extract text from a PDF, with OCR fallback."""
         page_texts = []
+        ocr_used = False
+        profile_picture = None
+
         with fitz.open(file_path) as doc:
             for page in doc:
-                text = page.get_text("text") or ""
+                text = (page.get_text("text") or "").strip()
+                if not text:
+                    text = self._extract_text_with_ocr(page).strip()
+                    if text:
+                        ocr_used = True
+
                 page_texts.append(text)
-        return "\n\n".join(page_texts)
+
+            profile_picture = self._extract_profile_picture(doc)
+
+        return "\n\n".join(page_texts), ocr_used, profile_picture
 
     def extract_from_pdf(self, file_path: str) -> dict:
         """
@@ -63,11 +158,11 @@ class ResumeDataExtractor:
             )
 
         print(f"  → 1. Reading PDF natively: {os.path.basename(file_path)} ...")
-        raw_text = self._extract_raw_text(file_path)
+        raw_text, ocr_used, profile_picture = self._extract_raw_text(file_path)
 
         if not raw_text.strip():
             # If the PDF is completely blank or an image with no text layer, we skip cost
-            raise ValueError("No extractable text found in PDF (might be an image/scan).")
+            raise ValueError("No extractable text found in PDF (native + OCR both empty).")
 
         print(f"  → 2. Structuring {len(raw_text)} chars using Gemini ...")
 
@@ -92,7 +187,10 @@ class ResumeDataExtractor:
 
         # Returns the parsed Pydantic object, which we convert to a dict
         candidate_obj = response.parsed
-        return candidate_obj.model_dump(mode="json")
+        result = candidate_obj.model_dump(mode="json")
+        result["ocr_used"] = ocr_used
+        result["profile_picture"] = profile_picture
+        return result
 
     def extract_folder(self, folder_path: str) -> list:
         """

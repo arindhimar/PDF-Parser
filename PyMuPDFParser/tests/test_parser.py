@@ -22,6 +22,9 @@ def _make_mock_page(text="Mocked Page Text"):
     """Returns a mock PyMuPDF Page object."""
     mock_page = MagicMock()
     mock_page.get_text.return_value = text
+    mock_page.get_images.return_value = []
+    mock_page.get_image_rects.return_value = []
+    mock_page.rect.height = 1000
     return mock_page
 
 def _make_mock_document(pages=1, text="Mocked Page Text"):
@@ -30,8 +33,9 @@ def _make_mock_document(pages=1, text="Mocked Page Text"):
     
     # Mocking the iterator behavior for `for page in doc:`
     mock_pages = [_make_mock_page(text) for _ in range(pages)]
-    mock_doc.__iter__.return_value = iter(mock_pages)
+    mock_doc.__iter__.side_effect = lambda: iter(mock_pages)
     mock_doc.__len__.return_value = pages
+    mock_doc.extract_image.return_value = {}
     
     # Mocking doc as a context manager (with fitz.open(...) as doc:)
     mock_doc.__enter__.return_value = mock_doc
@@ -58,7 +62,7 @@ class TestParsePdf:
         assert isinstance(result, dict)
 
     def test_parse_pdf_has_required_keys(self, tmp_path):
-        """parse_pdf() result must contain 'filename', 'text', 'page_count'."""
+        """parse_pdf() result must contain filename, text, page_count, profile_picture."""
         pdf = tmp_path / "resume.pdf"
         pdf.write_bytes(b"%PDF-1.4 fake")
 
@@ -69,6 +73,7 @@ class TestParsePdf:
         assert "filename"   in result
         assert "text"       in result
         assert "page_count" in result
+        assert "profile_picture" in result
 
     def test_parse_pdf_filename_is_basename(self, tmp_path):
         """filename in result must be just the file's basename, not the full path."""
@@ -110,6 +115,44 @@ class TestParsePdf:
             result = PDFParser().parse_pdf(str(pdf))
 
         assert result["page_count"] == 5
+
+    def test_parse_pdf_profile_picture_none_when_no_image(self, tmp_path):
+        """profile_picture should be None when the PDF has no image assets."""
+        pdf = tmp_path / "resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        with patch("parser.fitz.open", return_value=_make_mock_document()):
+            from parser import PDFParser
+            result = PDFParser().parse_pdf(str(pdf))
+
+        assert result["profile_picture"] is None
+
+    def test_parse_pdf_extracts_profile_picture_when_available(self, tmp_path):
+        """profile_picture should include metadata and bytes when a suitable image exists."""
+        pdf = tmp_path / "resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        mock_doc = _make_mock_document(pages=1, text="Profile Resume")
+        first_page = _make_mock_page("Profile Resume")
+        first_page.get_images.return_value = [(10, 0, 0, 0, 0, 0, 0, 0, 0)]
+        first_page.get_image_rects.return_value = [MagicMock(y0=120)]
+        mock_doc.__iter__.side_effect = lambda: iter([first_page])
+        mock_doc.extract_image.return_value = {
+            "image": b"fake-image-bytes",
+            "ext": "png",
+            "width": 180,
+            "height": 180,
+        }
+
+        with patch("parser.fitz.open", return_value=mock_doc):
+            from parser import PDFParser
+            result = PDFParser().parse_pdf(str(pdf))
+
+        assert result["profile_picture"] is not None
+        assert result["profile_picture"]["ext"] == "png"
+        assert result["profile_picture"]["image_bytes"] == b"fake-image-bytes"
+        assert result["profile_picture"]["width"] == 180
+        assert result["profile_picture"]["height"] == 180
 
 
 # ============================================================
@@ -163,7 +206,7 @@ class TestParseFolder:
         assert len(results) == 3, f"Expected 3, got {len(results)}"
 
     def test_parse_folder_each_result_has_required_keys(self, tmp_path):
-        """Every item in parse_folder() results must have filename, text, page_count."""
+        """Every item in parse_folder() results must have filename, text, page_count, profile_picture."""
         for name in ["r1.pdf", "r2.pdf"]:
             (tmp_path / name).write_bytes(b"%PDF-1.4")
 
@@ -175,6 +218,7 @@ class TestParseFolder:
             assert "filename"   in r
             assert "text"       in r
             assert "page_count" in r
+            assert "profile_picture" in r
 
 
 # ============================================================

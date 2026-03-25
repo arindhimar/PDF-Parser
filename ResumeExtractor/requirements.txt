@@ -1,4 +1,6 @@
 pymupdf
+pytesseract
+Pillow
 google-genai
 pydantic
 pytest

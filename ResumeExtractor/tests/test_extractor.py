@@ -18,6 +18,9 @@ from schema import CandidateProfile, CurrentStatus
 def _make_mock_page(text="Mocked Resume Text"):
     mock_page = MagicMock()
     mock_page.get_text.return_value = text
+    mock_page.get_images.return_value = []
+    mock_page.get_image_rects.return_value = []
+    mock_page.rect.height = 1000
     return mock_page
 
 def _make_mock_fitz_doc(pages=1, text="Mocked Resume Text"):
@@ -26,6 +29,7 @@ def _make_mock_fitz_doc(pages=1, text="Mocked Resume Text"):
     # Use side_effect to return a fresh iterator every time `iter(doc)` is called
     mock_doc.__iter__.side_effect = lambda: iter(mock_pages)
     mock_doc.__len__.return_value = pages
+    mock_doc.extract_image.return_value = {}
     mock_doc.__enter__.return_value = mock_doc
     mock_doc.__exit__.return_value = None
     return mock_doc
@@ -75,6 +79,8 @@ class TestExtractFromPdf:
         assert result["candidate_name"] == "John Doe"
         assert result["email_id"] == "john@example.com"
         assert "current_salary" in result
+        assert "ocr_used" in result
+        assert "profile_picture" in result
         
         # Test default/optional handles
         assert "expected_salary" in result
@@ -97,6 +103,57 @@ class TestExtractFromPdf:
         # Check what was passed to generate_content
         call_args = mock_gemini.models.generate_content.call_args[1]
         assert "TESTING OCR DATA" in call_args["contents"]
+
+    def test_ocr_fallback_used_for_image_based_pdf(self, tmp_path):
+        """If native text is empty, OCR fallback should provide text for Gemini."""
+        pdf = tmp_path / "resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_gemini_response()
+
+        with patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="")), \
+             patch("extractor.genai.Client", return_value=mock_gemini), \
+             patch("extractor.ResumeDataExtractor._extract_text_with_ocr", return_value="OCR FOUND TEXT"):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            result = extractor.extract_from_pdf(str(pdf))
+
+        call_args = mock_gemini.models.generate_content.call_args[1]
+        assert "OCR FOUND TEXT" in call_args["contents"]
+        assert result["ocr_used"] is True
+
+    def test_profile_picture_extracted_when_available(self, tmp_path):
+        """Profile picture metadata should be present when a suitable image is embedded."""
+        pdf = tmp_path / "resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_gemini_response()
+
+        mock_doc = _make_mock_fitz_doc(pages=1, text="Some resume text")
+        first_page = _make_mock_page("Some resume text")
+        first_page.get_images.return_value = [(10, 0, 0, 0, 0, 0, 0, 0, 0)]
+        first_page.get_image_rects.return_value = [MagicMock(y0=120)]
+        mock_doc.__iter__.side_effect = lambda: iter([first_page])
+        mock_doc.extract_image.return_value = {
+            "image": b"fake-image-bytes",
+            "ext": "png",
+            "width": 180,
+            "height": 180,
+        }
+
+        with patch("extractor.fitz.open", return_value=mock_doc), \
+             patch("extractor.genai.Client", return_value=mock_gemini):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            result = extractor.extract_from_pdf(str(pdf))
+
+        assert result["profile_picture"] is not None
+        assert result["profile_picture"]["ext"] == "png"
+        assert result["profile_picture"]["width"] == 180
+        assert result["profile_picture"]["height"] == 180
+        assert isinstance(result["profile_picture"]["image_base64"], str)
 
 
 # ============================================================
