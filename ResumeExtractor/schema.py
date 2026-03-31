@@ -32,6 +32,12 @@ class CurrentStatus(str, Enum):
     ON_A_BREAK = "On-a-break"
 
 
+class HiringType(str, Enum):
+    CAMPUS = "Campus"
+    FRESHER = "Fresher"
+    LATERAL = "Lateral"
+
+
 class CandidateProfile(BaseModel):
     # Core Details
     candidate_name: str = Field(
@@ -129,4 +135,60 @@ class CandidateProfile(BaseModel):
     # Projects
     projects: Optional[List[Project]] = Field(
         default=None, description="List of projects mentioned in the resume."
+    )
+
+
+class JobDescriptionProfile(BaseModel):
+    jd_document: Optional[str] = Field(
+        default=None,
+        description="Original JD document name or path reference."
+    )
+    project_name: Optional[str] = Field(
+        default=None, description="Project name mentioned in the JD."
+    )
+    designation: Optional[str] = Field(
+        default=None, description="Designation/title requested in the JD."
+    )
+    requisition_count: Optional[int] = Field(
+        default=None, description="How many people they want to hire for this requisition."
+    )
+    location: Optional[str] = Field(
+        default=None, description="Primary work location mentioned in the JD."
+    )
+    hiring_type: Optional[HiringType] = Field(
+        default=None, description="Type of hiring: Campus, Fresher, or Lateral."
+    )
+    grade: Optional[str] = Field(
+        default=None, description="Job grade/band/level, if provided."
+    )
+    role: Optional[str] = Field(
+        default=None, description="Role title in the JD."
+    )
+    role_description: Optional[str] = Field(
+        default=None, description="Role responsibilities and scope from the JD."
+    )
+    expected_experience_range: Optional[str] = Field(
+        default=None, description="Expected experience range (e.g. '3 - 6 Years')."
+    )
+    expected_salary_range: Optional[str] = Field(
+        default=None, description="Expected salary range (e.g. '8L - 12L CTC')."
+    )
+    must_have_skills: Optional[List[str]] = Field(
+        default=None, description="Mandatory skills required for this role."
+    )
+    good_to_have_skills: Optional[List[str]] = Field(
+        default=None, description="Optional or good-to-have skills for this role."
+    )
+    additional_inputs: Optional[str] = Field(
+        default=None,
+        description="Additional notes or inputs from client/project team."
+    )
+    expected_onboarding: Optional[str] = Field(
+        default=None, description="Expected onboarding timeline/date, if provided."
+    )
+    wfo: Optional[bool] = Field(
+        default=None, description="Whether work-from-office is required (Yes/No)."
+    )
+    client_approval: Optional[bool] = Field(
+        default=None, description="Whether client approval is required (Yes/No)."
     )

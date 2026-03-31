@@ -9,7 +9,7 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from schema import CandidateProfile, CurrentStatus
+from schema import CandidateProfile, CurrentStatus, JobDescriptionProfile, HiringType
 
 # ---------------------------------------------------------------------------
 # Helpers – build fake objects for PyMuPDF and Gemini
@@ -46,6 +46,32 @@ def _make_mock_gemini_response(structured_obj=None):
             current_status=CurrentStatus.WORKING,
             notice_period="30 days",
             current_salary=50000.0
+        )
+    mock_response.parsed = structured_obj
+    return mock_response
+
+
+def _make_mock_jd_response(structured_obj=None):
+    """Mocks a parsed JD response object from Gemini."""
+    mock_response = MagicMock()
+    if structured_obj is None:
+        structured_obj = JobDescriptionProfile(
+            project_name="Omniscient Internships",
+            designation="Software Engineer",
+            requisition_count=5,
+            location="Pune",
+            hiring_type=HiringType.FRESHER,
+            grade="G4",
+            role="Software Engineer",
+            role_description="Build and maintain backend services",
+            expected_experience_range="0 - 2 Years",
+            expected_salary_range="4L - 6L CTC",
+            must_have_skills=["Python", "SQL"],
+            good_to_have_skills=["FastAPI"],
+            additional_inputs="Immediate joiners preferred",
+            expected_onboarding="June 2026",
+            wfo=True,
+            client_approval=False,
         )
     mock_response.parsed = structured_obj
     return mock_response
@@ -155,6 +181,55 @@ class TestExtractFromPdf:
         assert result["profile_picture"]["height"] == 180
         assert isinstance(result["profile_picture"]["image_base64"], str)
 
+    def test_skills_newline_noise_is_sanitized(self, tmp_path):
+        """Noisy newline blobs inside skills should be split/cleaned without halting processing."""
+        pdf = tmp_path / "resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        noisy_profile = CandidateProfile(
+            candidate_name="Dhanesh Sakhala",
+            email_id="dhanesh@example.com",
+            phone_number="1234567890",
+            current_status=CurrentStatus.FRESHER,
+            skills=["Python", "OOP\n\n\n\n\nDhanesh Sakhala", "Python"],
+        )
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_gemini_response(noisy_profile)
+
+        with patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="Mock text")), \
+             patch("extractor.genai.Client", return_value=mock_gemini):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            result = extractor.extract_from_pdf(str(pdf))
+
+        assert result["skills"] == ["Python", "OOP"]
+
+    def test_extract_from_docx_converts_to_pdf(self, tmp_path):
+        """A .docx input should be converted to PDF before text extraction starts."""
+        docx = tmp_path / "resume.docx"
+        docx.write_text("fake docx")
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_gemini_response()
+
+        def _fake_convert(_in_path, out_path):
+            with open(out_path, "wb") as f:
+                f.write(b"%PDF-1.4 fake")
+
+        with patch("extractor.DOCX_CONVERTER_AVAILABLE", True), \
+             patch("extractor.docx2pdf_convert", side_effect=_fake_convert), \
+             patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="Mock text")) as fitz_open_mock, \
+             patch("extractor.genai.Client", return_value=mock_gemini):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            result = extractor.extract_from_pdf(str(docx))
+
+        assert result["candidate_name"] == "John Doe"
+        opened_path = fitz_open_mock.call_args[0][0]
+        assert opened_path.lower().endswith(".pdf")
+        assert not opened_path.lower().endswith(".docx")
+
 
 # ============================================================
 # 2. Extract Errors
@@ -180,6 +255,23 @@ class TestExtractErrors:
             extractor = ResumeDataExtractor(api_key="fake-key")
             with pytest.raises(ValueError, match="must be a PDF"):
                 extractor.extract_from_pdf(str(txt))
+
+
+class TestTextNormalization:
+
+    def test_normalize_raw_text_converts_smart_apostrophes(self):
+        """Curly apostrophes/quotes should be normalized before sending content to Gemini."""
+        with patch("extractor.genai.Client"):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+
+        raw = "Skills: OOp’s\nExperience\u00A0Section\n\n\n\nDone"
+        normalized = extractor._normalize_raw_text_for_llm(raw)
+
+        assert "OOp's" in normalized
+        assert "\u2019" not in normalized
+        assert "\u00A0" not in normalized
+        assert "\n\n\n\n" not in normalized
 
 
 # ============================================================
@@ -225,3 +317,98 @@ class TestExtractFolder:
         assert len(results) == 1
         assert "error" in results[0]
         assert "Corrupted PDF" in results[0]["error"]
+
+
+# ============================================================
+# 4. JD extraction
+# ============================================================
+
+class TestJDExtraction:
+
+    def test_extract_jd_from_pdf_returns_expected_fields(self, tmp_path):
+        """extract_jd_from_pdf() should return configured JD schema fields."""
+        pdf = tmp_path / "jd.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_jd_response()
+
+        with patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="JD text")), \
+             patch("extractor.genai.Client", return_value=mock_gemini):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            result = extractor.extract_jd_from_pdf(str(pdf))
+
+        assert result["project_name"] == "Omniscient Internships"
+        assert result["jd_document"] == "jd.pdf"
+        assert result["designation"] == "Software Engineer"
+        assert result["requisition_count"] == 5
+        assert result["hiring_type"] == "Fresher"
+        assert result["expected_experience_range"] == "0 - 2 Years"
+        assert result["expected_salary_range"] == "4L - 6L CTC"
+        assert result["must_have_skills"] == ["Python", "SQL"]
+        assert result["good_to_have_skills"] == ["FastAPI"]
+        assert result["additional_inputs"] == "Immediate joiners preferred"
+        assert result["wfo"] is True
+        assert result["client_approval"] is False
+        assert "ocr_used" in result
+
+    def test_extract_jd_folder_returns_list(self, tmp_path):
+        """extract_jd_folder() should process all JD PDFs in a folder."""
+        (tmp_path / "jd1.pdf").write_bytes(b"%PDF-1.4")
+        (tmp_path / "jd2.pdf").write_bytes(b"%PDF-1.4")
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_jd_response()
+
+        with patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="JD text")), \
+             patch("extractor.genai.Client", return_value=mock_gemini):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            results = extractor.extract_jd_folder(str(tmp_path))
+
+        assert isinstance(results, list)
+        assert len(results) == 2
+        for item in results:
+            assert "source_file" in item
+            assert "role" in item
+
+    def test_extract_jd_from_pdf_empty_text_raises(self, tmp_path):
+        """If native and OCR text are empty, extract_jd_from_pdf() should raise ValueError."""
+        pdf = tmp_path / "jd.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        mock_gemini = MagicMock()
+
+        with patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="")), \
+             patch("extractor.genai.Client", return_value=mock_gemini), \
+             patch("extractor.ResumeDataExtractor._extract_text_with_ocr", return_value=""):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            with pytest.raises(ValueError, match="No extractable text"):
+                extractor.extract_jd_from_pdf(str(pdf))
+
+    def test_extract_jd_from_docx_converts_to_pdf(self, tmp_path):
+        """A .docx JD should be converted to PDF before parsing."""
+        docx = tmp_path / "jd.docx"
+        docx.write_text("fake jd")
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.return_value = _make_mock_jd_response()
+
+        def _fake_convert(_in_path, out_path):
+            with open(out_path, "wb") as f:
+                f.write(b"%PDF-1.4 fake")
+
+        with patch("extractor.DOCX_CONVERTER_AVAILABLE", True), \
+             patch("extractor.docx2pdf_convert", side_effect=_fake_convert), \
+             patch("extractor.fitz.open", return_value=_make_mock_fitz_doc(text="JD text")) as fitz_open_mock, \
+             patch("extractor.genai.Client", return_value=mock_gemini):
+            from extractor import ResumeDataExtractor
+            extractor = ResumeDataExtractor(api_key="fake-key")
+            result = extractor.extract_jd_from_pdf(str(docx))
+
+        assert result["project_name"] == "Omniscient Internships"
+        opened_path = fitz_open_mock.call_args[0][0]
+        assert opened_path.lower().endswith(".pdf")
+        assert not opened_path.lower().endswith(".docx")

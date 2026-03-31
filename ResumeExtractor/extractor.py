@@ -9,11 +9,23 @@ extractor.py – AI-powered Resume Parsing Module.
 import os
 import time
 import base64
+import re
+import shutil
+import tempfile
+import threading
+from queue import Queue
 from io import BytesIO
 import fitz  # PyMuPDF
 from google import genai
 from google.genai import types
-from schema import CandidateProfile
+from schema import CandidateProfile, JobDescriptionProfile
+
+try:
+    from docx2pdf import convert as docx2pdf_convert
+    DOCX_CONVERTER_AVAILABLE = True
+except Exception:
+    docx2pdf_convert = None
+    DOCX_CONVERTER_AVAILABLE = False
 
 try:
     import pytesseract
@@ -42,6 +54,51 @@ class ResumeDataExtractor:
         self.client = genai.Client(api_key=self.api_key)
         # Using Gemini 2.5 Flash as it is highly efficient and excellent at structured data
         self.model_name = "gemini-2.5-flash"
+        self.request_timeout_seconds = int(os.environ.get("GEMINI_REQUEST_TIMEOUT_SECONDS", "120"))
+
+    def _prepare_pdf_input(self, file_path: str) -> tuple[str, str | None]:
+        """
+        Ensure the input is a PDF path.
+
+        Returns:
+            tuple[str, str | None]: (pdf_path, temp_dir_to_cleanup)
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if ext == ".pdf":
+            return file_path, None
+
+        if ext in (".doc", ".docx"):
+            if not DOCX_CONVERTER_AVAILABLE:
+                raise ValueError(
+                    "Word input received (.doc/.docx) but converter is unavailable. "
+                    "Install dependency 'docx2pdf' and ensure Microsoft Word is available on Windows."
+                )
+
+            temp_dir = tempfile.mkdtemp(prefix="resume_extractor_")
+            pdf_name = f"{os.path.splitext(os.path.basename(file_path))[0]}.pdf"
+            pdf_path = os.path.join(temp_dir, pdf_name)
+
+            try:
+                docx2pdf_convert(file_path, pdf_path)
+            except Exception as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise ValueError(f"Failed to convert Word document to PDF: {exc}") from exc
+
+            if not os.path.exists(pdf_path):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise ValueError("Word to PDF conversion failed: output PDF was not created.")
+
+            return pdf_path, temp_dir
+
+        raise ValueError(
+            f"Unsupported file type '{ext}'. Supported types are .pdf, .doc, .docx."
+        )
+
+    def _cleanup_temp_dir(self, temp_dir: str | None) -> None:
+        """Delete temporary conversion directory when it exists."""
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _extract_text_with_ocr(self, page) -> str:
         """Run OCR on a rendered page image when native text is missing."""
@@ -136,12 +193,139 @@ class ResumeDataExtractor:
 
         return "\n\n".join(page_texts), ocr_used, profile_picture
 
+    def _clean_string(self, value: str) -> str:
+        """Normalize whitespace/control characters to avoid malformed multi-line fields."""
+        if not isinstance(value, str):
+            return value
+
+        # Keep text single-line and compact while preserving readable content.
+        compact = re.sub(r"[\r\n\t]+", " ", value)
+        compact = re.sub(r"\s+", " ", compact).strip()
+        return compact
+
+    def _sanitize_skills(self, skills, candidate_name: str | None):
+        """Split noisy multiline skills, trim noise, remove duplicates and obvious false positives."""
+        if not isinstance(skills, list):
+            return skills
+
+        cleaned = []
+        seen = set()
+        candidate_name_clean = self._clean_string(candidate_name).lower() if isinstance(candidate_name, str) else None
+
+        for skill in skills:
+            if not isinstance(skill, str):
+                continue
+
+            # Break concatenated/newline blobs into individual candidates.
+            parts = [self._clean_string(part) for part in re.split(r"[\r\n]+", skill)]
+            for part in parts:
+                if not part:
+                    continue
+                if candidate_name_clean and candidate_name_clean in part.lower():
+                    pattern = re.compile(re.escape(candidate_name), flags=re.IGNORECASE)
+                    part = self._clean_string(pattern.sub("", part))
+                if not part:
+                    continue
+                if candidate_name_clean and part.lower() == candidate_name_clean:
+                    continue
+                if len(part) > 80:
+                    continue
+
+                key = part.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append(part)
+
+        return cleaned or None
+
+    def _sanitize_result(self, payload: dict) -> dict:
+        """Clean noisy string fields and fix known LLM extraction artifacts."""
+        if not isinstance(payload, dict):
+            return payload
+
+        def walk(node):
+            if isinstance(node, dict):
+                return {k: walk(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [walk(item) for item in node]
+            if isinstance(node, str):
+                return self._clean_string(node)
+            return node
+
+        cleaned = walk(payload)
+        cleaned["skills"] = self._sanitize_skills(
+            cleaned.get("skills"),
+            cleaned.get("candidate_name"),
+        )
+        return cleaned
+
+    def _normalize_raw_text_for_llm(self, raw_text: str) -> str:
+        """Normalize problematic unicode punctuation/control chars before sending text to Gemini."""
+        if not isinstance(raw_text, str):
+            return raw_text
+
+        translation = str.maketrans(
+            {
+                "\u2018": "'",  # left single quote
+                "\u2019": "'",  # right single quote
+                "\u201B": "'",  # single high-reversed-9 quote
+                "\u2032": "'",  # prime
+                "\u201C": '"',  # left double quote
+                "\u201D": '"',  # right double quote
+                "\u2013": "-",  # en dash
+                "\u2014": "-",  # em dash
+                "\u00A0": " ",  # non-breaking space
+            }
+        )
+
+        normalized = raw_text.translate(translation)
+        normalized = normalized.replace("\x00", "")
+        normalized = re.sub(r"\r\n?", "\n", normalized)
+        normalized = re.sub(r"\n{4,}", "\n\n\n", normalized)
+        return normalized.strip()
+
+    def _generate_content_with_timeout(self, raw_text: str, instruction: str):
+        """Call Gemini with a hard timeout so a stuck request does not halt the whole batch."""
+        result_queue = Queue(maxsize=1)
+
+        def _worker():
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=raw_text,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=CandidateProfile,
+                        system_instruction=instruction,
+                        temperature=0.0,
+                    ),
+                )
+                result_queue.put((True, response))
+            except Exception as exc:
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout=self.request_timeout_seconds)
+
+        if thread.is_alive():
+            raise TimeoutError(
+                f"Gemini request timed out after {self.request_timeout_seconds}s. "
+                "Please retry or increase GEMINI_REQUEST_TIMEOUT_SECONDS."
+            )
+
+        ok, payload = result_queue.get()
+        if ok:
+            return payload
+        raise payload
+
     def extract_from_pdf(self, file_path: str) -> dict:
         """
         Extracts raw text from a PDF and uses Gemini to map it to JSON.
 
         Args:
-            file_path (str): Path to the PDF resume.
+            file_path (str): Path to the resume file (.pdf/.doc/.docx).
 
         Returns:
             dict: The 21 parsed schema fields as a dictionary.
@@ -152,45 +336,93 @@ class ResumeDataExtractor:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        if not file_path.lower().endswith(".pdf"):
-            raise ValueError(
-                f"File must be a PDF (got '{file_path}'). Only .pdf files are supported."
+        pdf_path, temp_dir = self._prepare_pdf_input(file_path)
+
+        try:
+            print(f"  → 1. Reading document: {os.path.basename(file_path)} ...")
+            raw_text, ocr_used, profile_picture = self._extract_raw_text(pdf_path)
+            raw_text = self._normalize_raw_text_for_llm(raw_text)
+
+            if not raw_text.strip():
+                # If the document is blank or image-based and OCR fails, we skip cost.
+                raise ValueError("No extractable text found in document (native + OCR both empty).")
+
+            print(f"  → 2. Structuring {len(raw_text)} chars using Gemini ...")
+
+            # System instructions to guide the extraction
+            instruction = (
+                "You are an expert technical recruiter."
+                "Extract the requested candidate profile fields from the provided raw resume text."
+                "Obey the Pydantic schema strictly. If a piece of information is definitively missing "
+                "from the resume text, leave it as null (None)."
             )
 
-        print(f"  → 1. Reading PDF natively: {os.path.basename(file_path)} ...")
-        raw_text, ocr_used, profile_picture = self._extract_raw_text(file_path)
+            response = self._generate_content_with_timeout(raw_text, instruction)
 
-        if not raw_text.strip():
-            # If the PDF is completely blank or an image with no text layer, we skip cost
-            raise ValueError("No extractable text found in PDF (native + OCR both empty).")
+            # Returns the parsed Pydantic object, which we convert to a dict
+            candidate_obj = response.parsed
+            result = candidate_obj.model_dump(mode="json")
+            result = self._sanitize_result(result)
+            result["ocr_used"] = ocr_used
+            result["profile_picture"] = profile_picture
+            return result
+        finally:
+            self._cleanup_temp_dir(temp_dir)
 
-        print(f"  → 2. Structuring {len(raw_text)} chars using Gemini ...")
+    def extract_jd_from_pdf(self, file_path: str) -> dict:
+        """
+        Extracts raw text from a JD PDF and maps it to the JD schema.
 
-        # System instructions to guide the extraction
-        instruction = (
-            "You are an expert technical recruiter."
-            "Extract the requested candidate profile fields from the provided raw resume text."
-            "Obey the Pydantic schema strictly. If a piece of information is definitively missing "
-            "from the resume text, leave it as null (None)."
-        )
+        Args:
+            file_path (str): Path to the JD file (.pdf/.doc/.docx).
 
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=raw_text,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CandidateProfile,
-                system_instruction=instruction,
-                temperature=0.0, # Zero temp for maximum deterministic extraction
-            ),
-        )
+        Returns:
+            dict: Parsed JD fields.
 
-        # Returns the parsed Pydantic object, which we convert to a dict
-        candidate_obj = response.parsed
-        result = candidate_obj.model_dump(mode="json")
-        result["ocr_used"] = ocr_used
-        result["profile_picture"] = profile_picture
-        return result
+        Raises:
+            FileNotFoundError, ValueError
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        pdf_path, temp_dir = self._prepare_pdf_input(file_path)
+
+        try:
+            print(f"  → 1. Reading JD document: {os.path.basename(file_path)} ...")
+            raw_text, ocr_used, _ = self._extract_raw_text(pdf_path)
+
+            if not raw_text.strip():
+                raise ValueError("No extractable text found in document (native + OCR both empty).")
+
+            print(f"  → 2. Structuring {len(raw_text)} chars using Gemini ...")
+
+            instruction = (
+                "You are an expert talent acquisition specialist. "
+                "Extract requested job description fields from the provided JD text. "
+                "Obey the Pydantic schema strictly. "
+                "If a value is truly missing from the JD, return null. "
+                "For boolean fields, map yes/no style language to true/false. "
+                "Extract must-have and good-to-have skills as arrays when possible."
+            )
+
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=raw_text,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=JobDescriptionProfile,
+                    system_instruction=instruction,
+                    temperature=0.0,
+                ),
+            )
+
+            jd_obj = response.parsed
+            result = jd_obj.model_dump(mode="json")
+            result["jd_document"] = os.path.basename(file_path)
+            result["ocr_used"] = ocr_used
+            return result
+        finally:
+            self._cleanup_temp_dir(temp_dir)
 
     def extract_folder(self, folder_path: str) -> list:
         """
@@ -199,19 +431,19 @@ class ResumeDataExtractor:
         if not os.path.exists(folder_path):
             raise FileNotFoundError(f"Folder not found: {folder_path}")
 
-        pdf_files = sorted(
-            f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")
+        document_files = sorted(
+            f for f in os.listdir(folder_path) if f.lower().endswith((".pdf", ".doc", ".docx"))
         )
 
         results = []
-        total = len(pdf_files)
+        total = len(document_files)
 
         if total == 0:
-            print(f"  No PDF files found in: {folder_path}")
+            print(f"  No supported files found in: {folder_path}")
             return results
 
-        print(f"\nFound {total} PDF(s) in '{folder_path}':")
-        for i, filename in enumerate(pdf_files, start=1):
+        print(f"\nFound {total} document(s) in '{folder_path}':")
+        for i, filename in enumerate(document_files, start=1):
             full_path = os.path.join(folder_path, filename)
             print(f"\n[{i}/{total}] {filename}")
             last_exc = None
@@ -234,5 +466,53 @@ class ResumeDataExtractor:
                     "source_file": filename,
                     "error": str(last_exc),
                 })
+
+        return results
+
+    def extract_jd_folder(self, folder_path: str) -> list:
+        """
+        Processes all JD PDFs in a folder returning a list of dictionaries.
+        """
+        if not os.path.exists(folder_path):
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        document_files = sorted(
+            f for f in os.listdir(folder_path) if f.lower().endswith((".pdf", ".doc", ".docx"))
+        )
+
+        results = []
+        total = len(document_files)
+
+        if total == 0:
+            print(f"  No supported files found in: {folder_path}")
+            return results
+
+        print(f"\nFound {total} JD document(s) in '{folder_path}':")
+        for i, filename in enumerate(document_files, start=1):
+            full_path = os.path.join(folder_path, filename)
+            print(f"\n[{i}/{total}] {filename}")
+            last_exc = None
+            for attempt in range(2):
+                try:
+                    result_dict = self.extract_jd_from_pdf(full_path)
+                    result_dict["source_file"] = filename
+                    results.append(result_dict)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        print(f"  ⚠ Attempt 1 failed: {exc}")
+                        print("  ↻ Retrying in 3 seconds...")
+                        time.sleep(3)
+
+            if last_exc is not None:
+                print(f"  ✗ Failed after retry: {last_exc}")
+                results.append(
+                    {
+                        "source_file": filename,
+                        "error": str(last_exc),
+                    }
+                )
 
         return results

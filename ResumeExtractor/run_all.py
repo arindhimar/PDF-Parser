@@ -1,10 +1,10 @@
 """
-run_all.py – Batch-extract structured data from all PDFs in Dummy_Resumes/.
+run_all.py – Batch-extract structured data from resume PDFs and JD PDFs.
 
 Usage:
     python run_all.py
 
-JSON Results are saved to output/<filename>.json
+JSON Results are saved to output/ and output_jd/.
 """
 
 import os
@@ -16,7 +16,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 RESUMES_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Dummy_Resumes")
+JD_FOLDER      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Dummy_JD")
 OUTPUT_FOLDER  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+OUTPUT_JD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output_jd")
 
 def save_result(result: dict, output_dir: str) -> None:
     """Saves a parsed JSON dictionary to a structured .json file."""
@@ -32,7 +34,7 @@ def save_result(result: dict, output_dir: str) -> None:
 
 def main():
     print("=" * 60)
-    print("  Resume Data Extractor (LLM)")
+    print("  Resume + JD Data Extractor (LLM)")
     print("=" * 60)
 
     try:
@@ -43,6 +45,11 @@ def main():
         return
 
     results = extractor.extract_folder(RESUMES_FOLDER)
+
+    print("\n" + "=" * 60)
+    print("  JD EXTRACTION")
+    print("=" * 60)
+    jd_results = extractor.extract_jd_folder(JD_FOLDER)
 
     print("\n" + "=" * 60)
     print("  RESULTS SUMMARY")
@@ -57,6 +64,20 @@ def main():
             save_result(result, OUTPUT_FOLDER)
 
     print(f"\nDone! Processed {len(results)} resume(s). JSON output saved to: {OUTPUT_FOLDER}")
+
+    print("\n" + "=" * 60)
+    print("  JD RESULTS SUMMARY")
+    print("=" * 60)
+
+    for result in jd_results:
+        print(f"\n📄 {result['source_file']}")
+        if "error" in result:
+            print(f"   ✗ Error: {result['error']}")
+        else:
+            print(f"   ✓ Success - Extracted JD role: {result.get('role')}")
+            save_result(result, OUTPUT_JD_FOLDER)
+
+    print(f"\nDone! Processed {len(jd_results)} JD file(s). JSON output saved to: {OUTPUT_JD_FOLDER}")
 
 if __name__ == "__main__":
     main()

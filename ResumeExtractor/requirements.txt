@@ -1,4 +1,5 @@
 pymupdf
+docx2pdf
 pytesseract
 Pillow
 google-genai
